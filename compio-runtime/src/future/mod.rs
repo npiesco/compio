@@ -52,14 +52,15 @@ fn submit_raw<T: OpCode + 'static>(
     }
 }
 
-fn try_submit_raw<T: OpCode + 'static>(
+fn try_submit_raw<T: OpCode + 'static, C: 'static>(
     driver: &mut Proactor,
     op: T,
+    funding: C,
     extra: Option<Extra>,
 ) -> Result<PushEntry<Key<T>, BufResult<usize, T>>, T> {
     match extra {
-        Some(e) => driver.try_push_with_extra(op, e),
-        None => driver.try_push(op),
+        Some(e) => driver.try_push_funded_with_extra(op, funding, e),
+        None => driver.try_push_funded(op, funding),
     }
 }
 

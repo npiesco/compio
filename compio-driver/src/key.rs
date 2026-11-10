@@ -4,9 +4,9 @@ use std::{
     fmt::{self, Debug},
     hash::Hash,
     io,
-    mem::{self, ManuallyDrop},
+    mem::{self, ManuallyDrop, MaybeUninit},
     ops::{Deref, DerefMut},
-    ptr,
+    ptr::{self, NonNull},
     task::Waker,
 };
 
@@ -34,7 +34,75 @@ pub(crate) struct RawOp<M: ?Sized> {
     // The cancelled flag indicates the op has been cancelled.
     cancelled: bool,
     result: PushEntry<Option<Waker>, io::Result<usize>>,
+    // What pays for the block the op is kept in. It is taken out by the last
+    // reference to the block, strong or weak, and dropped after the block is
+    // freed; dropping the op itself leaves it in place.
+    funding: ManuallyDrop<Funding>,
     pub(crate) carrier: M,
+}
+
+/// How many words of room an operation's funding may take in the block the
+/// operation is kept in; see [`Proactor::try_push_funded`].
+///
+/// [`Proactor::try_push_funded`]: crate::Proactor::try_push_funded
+pub const OP_FUNDING_WORDS: usize = 3;
+
+/// A funding kept in an operation's block, type-erased: dropped, it drops the
+/// funding it was made from, if any.
+pub(crate) struct Funding {
+    value: MaybeUninit<[usize; OP_FUNDING_WORDS]>,
+    drop: Option<unsafe fn(*mut ())>,
+}
+
+impl Funding {
+    /// No funding.
+    pub(crate) const NONE: Self = Self {
+        value: MaybeUninit::uninit(),
+        drop: None,
+    };
+
+    /// Keep `funding`, which must fit in [`OP_FUNDING_WORDS`] words, aligned
+    /// to a word at most.
+    pub(crate) fn new<C: 'static>(funding: C) -> Self {
+        const {
+            assert!(
+                mem::size_of::<C>() <= mem::size_of::<[usize; OP_FUNDING_WORDS]>()
+                    && mem::align_of::<C>() <= mem::align_of::<usize>(),
+                "an operation's funding must fit in `OP_FUNDING_WORDS` words"
+            )
+        };
+        if !mem::needs_drop::<C>() {
+            // Nothing is given back when it goes
+            mem::forget(funding);
+            return Self::NONE;
+        }
+        let mut value = MaybeUninit::<[usize; OP_FUNDING_WORDS]>::uninit();
+        // SAFETY: `C` fits the room and its alignment, as asserted above
+        unsafe { value.as_mut_ptr().cast::<C>().write(funding) };
+        Self {
+            value,
+            drop: Some(drop_funding::<C>),
+        }
+    }
+}
+
+/// Drops the funding of type `C` kept at `value`.
+///
+/// # Safety
+///
+/// `value` must point to a `C`, which is not used after.
+unsafe fn drop_funding<C>(value: *mut ()) {
+    unsafe { value.cast::<C>().drop_in_place() }
+}
+
+impl Drop for Funding {
+    fn drop(&mut self) {
+        if let Some(drop) = self.drop {
+            // SAFETY: `drop` was made for the funding kept in `value`, which is
+            // dropped once, here
+            unsafe { drop(self.value.as_mut_ptr().cast()) }
+        }
+    }
 }
 
 impl<C: ?Sized> RawOp<C> {
@@ -109,17 +177,22 @@ pub struct Key<T> {
 /// Internally, it uses [`ThinCell`] to manage the reference count and borrowing
 /// state. It provides methods to manipulate the underlying operation, such as
 /// setting results, checking completion status, and cancelling the operation.
+///
+/// The last reference to the operation's block, this or a [`WeakKey`], drops
+/// the funding of the operation after the block is freed.
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct ErasedKey {
-    inner: ThinCell<RawOp<dyn Carry>>,
+    inner: ManuallyDrop<ThinCell<RawOp<dyn Carry>>>,
 }
 
 /// A weak reference of [`ErasedKey`].
 #[derive(Clone)]
-#[repr(transparent)]
 pub(crate) struct WeakKey {
-    inner: Weak<RawOp<dyn Carry>>,
+    inner: ManuallyDrop<Weak<RawOp<dyn Carry>>>,
+    // Where the funding of the operation is kept in its block, for the last
+    // reference to take.
+    funding: NonNull<ManuallyDrop<Funding>>,
 }
 
 impl<T> Clone for Key<T> {
@@ -172,15 +245,16 @@ impl<T: OpCode + 'static> Key<T> {
         }
     }
 
-    /// Create [`RawOp`] and get the [`Key`] to it, unless the allocator refuses
-    /// the block it is kept in: refused, nothing is allocated and `op` is
-    /// handed back.
-    pub(crate) fn try_new(
+    /// Create [`RawOp`] funded by `funding` and get the [`Key`] to it, unless
+    /// the allocator refuses the block it is kept in: refused, nothing is
+    /// allocated, `funding` is dropped and `op` is handed back.
+    pub(crate) fn try_new_funded(
         op: T,
         extra: impl Into<Extra>,
         driver_ty: DriverType,
+        funding: Funding,
     ) -> Result<Self, T> {
-        let erased = ErasedKey::try_new(op, extra.into(), driver_ty)?;
+        let erased = ErasedKey::try_new_funded(op, extra.into(), driver_ty, funding)?;
 
         Ok(Self {
             erased,
@@ -230,28 +304,37 @@ impl ErasedKey {
             extra,
             cancelled: false,
             result: PushEntry::Pending(None),
+            funding: ManuallyDrop::new(Funding::NONE),
             carrier: Carrier::new(op, driver_ty),
         };
         Self::from_cell(ThinCell::new(raw_op))
     }
 
-    /// Create [`RawOp`] and get the [`ErasedKey`] to it, unless the allocator
-    /// refuses the block it is kept in: refused, nothing is allocated and `op`
-    /// is handed back.
-    pub(crate) fn try_new<T: OpCode + 'static>(
+    /// Create [`RawOp`] funded by `funding` and get the [`ErasedKey`] to it,
+    /// unless the allocator refuses the block it is kept in: refused, nothing
+    /// is allocated, `funding` is dropped and `op` is handed back.
+    pub(crate) fn try_new_funded<T: OpCode + 'static>(
         op: T,
         extra: Extra,
         driver_ty: DriverType,
+        funding: Funding,
     ) -> Result<Self, T> {
         let raw_op = RawOp {
             extra,
             cancelled: false,
             result: PushEntry::Pending(None),
+            funding: ManuallyDrop::new(funding),
             carrier: Carrier::new(op, driver_ty),
         };
         match ThinCell::try_new(raw_op) {
             Ok(inner) => Ok(Self::from_cell(inner)),
-            Err(raw_op) => Err(raw_op.carrier.into_inner()),
+            Err(raw_op) => {
+                let RawOp {
+                    funding, carrier, ..
+                } = raw_op;
+                drop(ManuallyDrop::into_inner(funding));
+                Err(carrier.into_inner())
+            }
         }
     }
 
@@ -263,7 +346,9 @@ impl ErasedKey {
         //   until move out
         unsafe { inner.borrow_unchecked().carrier.init() };
         Self {
-            inner: unsafe { inner.unsize(|p| p as *const Inner<RawOp<dyn Carry>>) },
+            inner: ManuallyDrop::new(unsafe {
+                inner.unsize(|p| p as *const Inner<RawOp<dyn Carry>>)
+            }),
         }
     }
 
@@ -274,7 +359,7 @@ impl ErasedKey {
     /// `user_data` must be a valid pointer to `RawOp<dyn OpCode>` previously
     /// created by [`Key::into_raw`].
     pub(crate) unsafe fn from_raw(user_data: usize) -> Self {
-        let inner = unsafe { ThinCell::from_raw(user_data as *mut ()) };
+        let inner = ManuallyDrop::new(unsafe { ThinCell::from_raw(user_data as *mut ()) });
         Self { inner }
     }
 
@@ -287,14 +372,15 @@ impl ErasedKey {
     #[cfg(windows)]
     pub(crate) unsafe fn from_optr(optr: *mut crate::sys::Overlapped) -> Self {
         let ptr = unsafe { optr.cast::<usize>().offset(-2).cast() };
-        let inner = unsafe { ThinCell::from_raw(ptr) };
+        let inner = ManuallyDrop::new(unsafe { ThinCell::from_raw(ptr) });
         Self { inner }
     }
 
     /// Leak self into a pointer to `Overlapped`.
     #[cfg(windows)]
     pub(crate) fn into_optr(self) -> *mut crate::sys::Overlapped {
-        unsafe { self.inner.leak().cast::<usize>().add(2).cast() }
+        let this = ManuallyDrop::new(self);
+        unsafe { this.inner.as_ptr().cast_mut().cast::<usize>().add(2).cast() }
     }
 
     /// Get a weak reference to the allocation.
@@ -304,8 +390,15 @@ impl ErasedKey {
     ///
     /// [`take_result`]: Self::take_result
     pub(crate) fn downgrade(&self) -> WeakKey {
+        // The funding's place is derived from the pointer to the whole block,
+        // as it is used once the op is gone.
+        let block = self.inner.as_ptr();
+        let at = (&raw const self.borrow().funding).addr() - block.addr();
+        let funding = block.cast_mut().cast::<u8>().wrapping_add(at).cast();
         WeakKey {
-            inner: self.inner.downgrade(),
+            inner: ManuallyDrop::new(self.inner.downgrade()),
+            // SAFETY: a place in a live block is not null
+            funding: unsafe { NonNull::new_unchecked(funding) },
         }
     }
 
@@ -319,7 +412,8 @@ impl ErasedKey {
 
     /// Leak self and get the pointer as `user_data`.
     pub(crate) fn into_raw(self) -> usize {
-        self.inner.leak() as _
+        let this = ManuallyDrop::new(self);
+        this.inner.as_ptr() as _
     }
 
     #[inline]
@@ -340,7 +434,7 @@ impl ErasedKey {
 
     /// Whether the key is uniquely owned.
     pub(crate) fn is_unique(&self) -> bool {
-        ThinCell::count(&self.inner) == 1
+        self.inner.count() == 1
     }
 
     /// Complete the op and wake up the future if a waker is set.
@@ -387,11 +481,31 @@ impl ErasedKey {
     /// Panics if the result is not ready or the `Key` is not unique (multiple
     /// references or borrowed).
     unsafe fn take_result<T: OpCode>(self) -> BufResult<usize, T> {
+        let mut this = ManuallyDrop::new(self);
+        // Taken first, dropped after the block is freed, below
+        let funding = this.take_last_funding();
+        // SAFETY: The cell is taken once, here, and `this` is not dropped.
+        let inner = unsafe { ManuallyDrop::take(&mut this.inner) };
         // SAFETY: Caller guarantees that `T` is the actual concrete type.
-        let this = unsafe { self.inner.downcast_unchecked::<RawOp<Carrier<T>>>() };
-        let op = this.try_unwrap().map_err(|_| ()).expect("Key not unique");
+        let inner = unsafe { inner.downcast_unchecked::<RawOp<Carrier<T>>>() };
+        let op = inner.try_unwrap().map_err(|_| ()).expect("Key not unique");
         let res = op.result.take_ready().expect("Result not ready");
-        BufResult(res, op.carrier.into_inner())
+        let res = BufResult(res, op.carrier.into_inner());
+        drop(funding);
+        res
+    }
+
+    /// Take the funding out of the op's block if this is the last reference to
+    /// the block, strong or weak: the block is freed as it goes, and the
+    /// funding, paying for it, is dropped only after. Otherwise the funding is
+    /// left in the block, for whichever reference is last, and none is taken.
+    fn take_last_funding(&mut self) -> Funding {
+        if self.inner.strong_count() != 1 || self.inner.weak_count() != 1 {
+            return Funding::NONE;
+        }
+        // SAFETY: This is the last reference, so nothing borrows the op, and
+        // the funding is taken once, by the last reference.
+        unsafe { ManuallyDrop::take(&mut self.inner.borrow_unchecked().funding) }
     }
 
     /// Unsafely freeze the `Key` by bypassing borrow flag of [`ThinCell`],
@@ -412,6 +526,15 @@ impl ErasedKey {
     }
 }
 
+impl Drop for ErasedKey {
+    fn drop(&mut self) {
+        let funding = self.take_last_funding();
+        // SAFETY: The cell is dropped once, here, and not used after.
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
+        drop(funding);
+    }
+}
+
 impl Debug for ErasedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ErasedKey({})", self.inner.as_ptr() as usize)
@@ -421,12 +544,30 @@ impl Debug for ErasedKey {
 impl WeakKey {
     pub(crate) fn upgrade(&self) -> Option<ErasedKey> {
         Some(ErasedKey {
-            inner: self.inner.upgrade()?,
+            inner: ManuallyDrop::new(self.inner.upgrade()?),
         })
     }
 
     pub(crate) fn as_ptr(&self) -> *const () {
         self.inner.as_ptr()
+    }
+}
+
+impl Drop for WeakKey {
+    fn drop(&mut self) {
+        // The last reference: the op was dropped, leaving its funding in the
+        // block, which goes with this reference.
+        let funding = if self.inner.strong_count() == 0 && self.inner.weak_count() == 1 {
+            // SAFETY: The block is still allocated, as this reference holds it,
+            // and nothing else refers to it; the funding is taken once, by the
+            // last reference.
+            unsafe { ManuallyDrop::take(self.funding.as_mut()) }
+        } else {
+            Funding::NONE
+        };
+        // SAFETY: The weak reference is dropped once, here, and not used after.
+        unsafe { ManuallyDrop::drop(&mut self.inner) };
+        drop(funding);
     }
 }
 

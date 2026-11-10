@@ -1,4 +1,5 @@
 use std::{
+    alloc::{Layout, alloc},
     array,
     fmt::Debug,
     mem::{ManuallyDrop, MaybeUninit, offset_of},
@@ -48,10 +49,23 @@ impl Debug for Task {
 /// Allocated part of a task, which contains the future, result and all
 /// necessary metadata. A pointer to `TaskAlloc` is always a valid pointer to a
 /// `Header`.
+///
+/// `funding` pays for the allocation: it is dropped only after the allocation
+/// is freed, by [`TaskAlloc::dealloc`].
 #[repr(C)]
-struct TaskAlloc<F: Future> {
+struct TaskAlloc<F: Future, C = ()> {
     header: Header,
     future: UnsafeCell<FutureState<F>>,
+    funding: ManuallyDrop<C>,
+}
+
+/// The layout of the block a task running `F`, funded by `C`, is allocated in
+/// by [`Executor::try_spawn_funded`]: its size is all the spawn allocates, so
+/// it is what to charge before spawning.
+///
+/// [`Executor::try_spawn_funded`]: crate::Executor::try_spawn_funded
+pub fn task_layout<F: Future + 'static, C: 'static>() -> Layout {
+    Layout::new::<TaskAlloc<F, C>>()
 }
 
 struct Header {
@@ -77,7 +91,7 @@ struct TaskVtable {
     drop_future: unsafe fn(NonNull<Header>, bool),
 }
 
-impl<F: Future + 'static> TaskAlloc<F> {
+impl<F: Future + 'static, C: 'static> TaskAlloc<F, C> {
     const FUT_OFFSET: usize = offset_of!(Self, future);
     const VTABLE: &'static TaskVtable = &TaskVtable {
         dealloc: Self::dealloc,
@@ -163,10 +177,41 @@ impl<F: Future + 'static> TaskAlloc<F> {
         // the console forever. The subscriber is then reentered while
         // unwinding, so a panic inside it aborts rather than unwinds.
         //
+        // The funding pays for the allocation, so it is taken out first and
+        // dropped only once the allocation is freed. It may not be `Send`, so
+        // it is dropped only on the thread the task was spawned on: if the
+        // last reference goes on another, it is leaked, keeping what it holds.
+        //
         // SAFETY: The caller guarantees that the pointer is valid and properly
-        // aligned for `TaskAlloc<F>`, and that no other reference to
-        // the allocation exists.
-        drop(unsafe { Box::from_raw(header.as_ptr().cast::<TaskAlloc<F>>()) });
+        // aligned for `TaskAlloc<F, C>`, and that no other reference to
+        // the allocation exists. The funding is read out once, here, and the
+        // box does not drop it again, as it is kept in a `ManuallyDrop`.
+        let alloc = header.as_ptr().cast::<TaskAlloc<F, C>>();
+        let funding = unsafe { ptr::read(&raw const (*alloc).funding) };
+        let owner = unsafe { (*alloc).header.tracker.valid() };
+        drop(unsafe { Box::from_raw(alloc) });
+        if owner {
+            drop(ManuallyDrop::into_inner(funding));
+        }
+    }
+}
+
+impl Header {
+    fn new<F: Future + 'static, C: 'static, const N: usize>(
+        id: TaskId,
+        shared: NonNull<Shared>,
+        tracker: SendWrapper<()>,
+        meta: SpawnMeta,
+    ) -> Self {
+        Header {
+            id,
+            state: State::new::<N>(),
+            vtable: TaskAlloc::<F, C>::VTABLE,
+            tracker: ManuallyDrop::new(tracker),
+            shared: AtomicPtr::new(shared.as_ptr()),
+            waker: UnsafeCell::new(MaybeUninit::uninit()),
+            span: TaskSpan::new::<F>(meta),
+        }
     }
 }
 
@@ -179,18 +224,11 @@ impl Task {
         meta: SpawnMeta,
     ) -> [Task; N] {
         let alloc = Box::new(TaskAlloc {
-            header: Header {
-                id,
-                state: State::new::<N>(),
-                vtable: TaskAlloc::<F>::VTABLE,
-                tracker: ManuallyDrop::new(tracker),
-                shared: AtomicPtr::new(shared.as_ptr()),
-                waker: UnsafeCell::new(MaybeUninit::uninit()),
-                span: TaskSpan::new::<F>(meta),
-            },
+            header: Header::new::<F, (), N>(id, shared, tracker, meta),
             future: UnsafeCell::new(FutureState {
                 future: ManuallyDrop::new(future),
             }),
+            funding: ManuallyDrop::new(()),
         });
 
         // SAFETY: The pointer was returned by `Box`, which guarantees that it's
@@ -198,6 +236,43 @@ impl Task {
         let ptr = unsafe { NonNull::new_unchecked(Box::into_raw(alloc) as _) };
 
         array::from_fn(|_| Task(ptr))
+    }
+
+    /// Allocate the task like [`new`](Self::new), funded by `funding`, unless
+    /// the allocator refuses the block: refused, nothing is allocated and the
+    /// future and its funding are handed back.
+    ///
+    /// The funding is dropped only after the block is freed.
+    pub fn try_new<F: Future + 'static, C: 'static, const N: usize>(
+        id: TaskId,
+        shared: NonNull<Shared>,
+        tracker: SendWrapper<()>,
+        future: F,
+        funding: C,
+        meta: SpawnMeta,
+    ) -> Result<[Task; N], (F, C)> {
+        // SAFETY: The layout is not zero-sized, as it holds the header.
+        let alloc = unsafe { alloc(task_layout::<F, C>()) }.cast::<TaskAlloc<F, C>>();
+        let Some(alloc) = NonNull::new(alloc) else {
+            return Err((future, funding));
+        };
+
+        // SAFETY: The block was just allocated with the layout of
+        // `TaskAlloc<F, C>` and nothing reads it yet; it is freed as a box of
+        // `TaskAlloc<F, C>` by `TaskAlloc::dealloc`, through the global
+        // allocator it came from.
+        unsafe {
+            alloc.write(TaskAlloc {
+                header: Header::new::<F, C, N>(id, shared, tracker, meta),
+                future: UnsafeCell::new(FutureState {
+                    future: ManuallyDrop::new(future),
+                }),
+                funding: ManuallyDrop::new(funding),
+            })
+        };
+
+        let ptr = alloc.cast::<Header>();
+        Ok(array::from_fn(|_| Task(ptr)))
     }
 
     pub unsafe fn from_raw(ptr: *const ()) -> Self {

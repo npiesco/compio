@@ -157,6 +157,41 @@ impl TaskQueue {
         }
     }
 
+    /// Insert a task funded by `funding` like [`insert`](Self::insert), unless
+    /// the allocator refuses the memory it takes: room for it in the map, or
+    /// its block. Refused, nothing is allocated and the future and its funding
+    /// are handed back.
+    pub fn try_insert<F: Future + 'static, C: 'static>(
+        &self,
+        shared: NonNull<Shared>,
+        tracker: SendWrapper<()>,
+        future: F,
+        funding: C,
+        meta: SpawnMeta,
+    ) -> Result<Task, (F, C)> {
+        unsafe {
+            self.with_inner(|inner| {
+                if inner.map.try_reserve(1).is_err() {
+                    return Err((future, funding));
+                }
+                let mut ret = None;
+                let key = inner.map.try_insert_with_key(|key| {
+                    let [ptr, r] =
+                        Task::try_new::<F, C, 2>(key, shared, tracker, future, funding, meta)?;
+                    ret = Some(r);
+                    Ok(Item {
+                        prev: None,
+                        next: None,
+                        task: Some(ptr),
+                        is_hot: true,
+                    })
+                })?;
+                inner.link_tail::<HOT>(key);
+                Ok(ret.take().expect("Task was not initialized"))
+            })
+        }
+    }
+
     pub fn make_hot(&self, key: TaskId) {
         unsafe { self.with_inner(|inner| inner.make_hot(key)) }
     }

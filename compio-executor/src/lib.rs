@@ -27,6 +27,7 @@ use compio_send_wrapper::SendWrapper;
 pub use console::SpawnMeta;
 use crossbeam_queue::SegQueue;
 pub use join_handle::{JoinError, JoinHandle, ResumeUnwind};
+pub use task::task_layout;
 use util::panic_guard;
 
 cfg_select! {
@@ -189,6 +190,47 @@ impl Executor {
         let task = queue.insert(self.ptr, tracker, fut, meta);
 
         JoinHandle::new(task)
+    }
+
+    /// Spawn a future onto the executor like [`spawn`](Self::spawn), funded by
+    /// `funding`, unless the allocator refuses the memory the task takes: its
+    /// block, of [`task_layout::<F, C>`](task_layout), or room for it in the
+    /// queue.
+    ///
+    /// Refused, nothing is allocated, `funding` is dropped and the future is
+    /// handed back in [`Err`], where [`spawn`](Self::spawn) would abort.
+    ///
+    /// Spawned, the funding is kept in the task's block and dropped only after
+    /// the block is freed, when the last reference to the task goes. As it may
+    /// not be [`Send`], it is leaked instead, keeping what it holds, if that
+    /// happens on another thread than this executor's.
+    #[track_caller]
+    pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
+        &self,
+        fut: F,
+        funding: C,
+    ) -> Result<JoinHandle<F::Output>, F> {
+        self.try_spawn_funded_at(fut, funding, SpawnMeta::capture())
+    }
+
+    /// Spawn a future onto the executor like
+    /// [`try_spawn_funded`](Self::try_spawn_funded), attributing it to `meta`.
+    ///
+    /// See [`spawn_at`](Self::spawn_at) for what `meta` is good for.
+    pub fn try_spawn_funded_at<F: Future + 'static, C: 'static>(
+        &self,
+        fut: F,
+        funding: C,
+        meta: SpawnMeta,
+    ) -> Result<JoinHandle<F::Output>, F> {
+        let shared = self.shared();
+        let tracker = shared.queue.tracker();
+        // SAFETY: Executor cannot be sent to ther thread
+        let queue = unsafe { shared.queue.get_unchecked() };
+        match queue.try_insert(self.ptr, tracker, fut, funding, meta) {
+            Ok(task) => Ok(JoinHandle::new(task)),
+            Err((fut, _)) => Err(fut),
+        }
     }
 
     /// Retrieve all sync tasks, schedule those to the tail of `hot` queue

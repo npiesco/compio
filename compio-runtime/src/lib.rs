@@ -48,7 +48,7 @@ use compio_buf::{BufResult, IntoInner};
 use compio_driver::{AsRawFd, DriverType, OpCode, Proactor, ProactorBuilder, RawFd, op::Asyncify};
 pub use compio_driver::{BufferPool, ErrorExt};
 use compio_executor::{Executor, ExecutorConfig};
-pub use compio_executor::{JoinError, JoinHandle, ResumeUnwind, SpawnMeta, console};
+pub use compio_executor::{JoinError, JoinHandle, ResumeUnwind, SpawnMeta, console, task_layout};
 use compio_log::{debug, instrument};
 
 use crate::affinity::bind_to_cpu_set;
@@ -240,6 +240,41 @@ impl Runtime {
         self.executor.spawn_at(future, meta)
     }
 
+    /// Spawns a new asynchronous task like [`spawn`](Self::spawn), funded by
+    /// `funding`, unless the allocator refuses the memory the task takes: its
+    /// block, of [`task_layout::<F, C>`](task_layout), or room for it in the
+    /// executor's queue.
+    ///
+    /// Refused, nothing is allocated, `funding` is dropped and the future is
+    /// handed back in [`Err`], where [`spawn`](Self::spawn) would abort.
+    ///
+    /// Spawned, the funding is kept in the task's block and dropped only after
+    /// the block is freed, when the last reference to the task goes. As it may
+    /// not be [`Send`], it is leaked instead, keeping what it holds, if that
+    /// happens on another thread than this runtime's.
+    #[track_caller]
+    pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
+        &self,
+        future: F,
+        funding: C,
+    ) -> Result<JoinHandle<F::Output>, F> {
+        self.try_spawn_funded_at(future, funding, SpawnMeta::capture())
+    }
+
+    /// Spawns a new asynchronous task like
+    /// [`try_spawn_funded`](Self::try_spawn_funded), attributing it to `meta`
+    /// instead of to the caller.
+    ///
+    /// See [`spawn_at`](Self::spawn_at) for what `meta` is good for.
+    pub fn try_spawn_funded_at<F: Future + 'static, C: 'static>(
+        &self,
+        future: F,
+        funding: C,
+        meta: SpawnMeta,
+    ) -> Result<JoinHandle<F::Output>, F> {
+        self.executor.try_spawn_funded_at(future, funding, meta)
+    }
+
     /// Spawns a blocking task in a new thread, and wait for it.
     ///
     /// The task will not be cancelled even if the future is dropped.
@@ -298,7 +333,28 @@ impl Runtime {
     ///
     /// You only need this when authoring your own [`OpCode`].
     pub fn try_submit<T: OpCode + 'static>(&self, op: T) -> TrySubmit<T> {
-        TrySubmit::new(self.driver.clone(), op)
+        TrySubmit::new(self.driver.clone(), op, ())
+    }
+
+    /// Submit an operation to the runtime like [`try_submit`], funded by
+    /// `funding`: refused, nothing is allocated, `funding` is dropped and the
+    /// future hands the operation back in [`Err`].
+    ///
+    /// Pushed, the funding is kept with the operation and dropped only after
+    /// the block the operation is kept in is freed, even when the future is
+    /// dropped while the kernel still uses the operation. It must fit in
+    /// [`OP_FUNDING_WORDS`] words; see [`Proactor::try_push_funded`].
+    ///
+    /// You only need this when authoring your own [`OpCode`].
+    ///
+    /// [`try_submit`]: Self::try_submit
+    /// [`OP_FUNDING_WORDS`]: compio_driver::OP_FUNDING_WORDS
+    pub fn try_submit_funded<T: OpCode + 'static, C: 'static>(
+        &self,
+        op: T,
+        funding: C,
+    ) -> TrySubmit<T, C> {
+        TrySubmit::new(self.driver.clone(), op, funding)
     }
 
     /// Submit a multishot operation to the runtime.
@@ -571,6 +627,26 @@ pub fn spawn_at<F: Future + 'static>(future: F, meta: SpawnMeta) -> JoinHandle<F
     Runtime::with_current(|r| r.spawn_at(future, meta))
 }
 
+/// Spawns a new asynchronous task funded by `funding`, unless the allocator
+/// refuses the memory it takes: refused, nothing is allocated, `funding` is
+/// dropped and the future is handed back in [`Err`].
+///
+/// See [`Runtime::try_spawn_funded`] for when the funding is dropped.
+///
+/// ## Panics
+///
+/// This method doesn't create runtime. It tries to obtain the current runtime
+/// by [`Runtime::with_current`].
+#[track_caller]
+pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
+    future: F,
+    funding: C,
+) -> Result<JoinHandle<F::Output>, F> {
+    // See the note in `spawn` on why this is not inlined below.
+    let meta = SpawnMeta::capture();
+    Runtime::with_current(|r| r.try_spawn_funded_at(future, funding, meta))
+}
+
 /// Spawns a blocking task in a new thread, and wait for it.
 ///
 /// The task will not be cancelled even if the future is dropped.
@@ -626,6 +702,22 @@ pub fn submit<T: OpCode + 'static>(op: T) -> Submit<T> {
 /// [`Runtime::with_current`].
 pub fn try_submit<T: OpCode + 'static>(op: T) -> TrySubmit<T> {
     Runtime::with_current(|r| r.try_submit(op))
+}
+
+/// Submit an operation to the current runtime funded by `funding`, and return a
+/// future for it that hands the operation back in [`Err`], allocating nothing
+/// and dropping `funding`, if the allocator refuses the memory the driver needs
+/// to keep it.
+///
+/// See [`Runtime::try_submit_funded`] for when the funding is dropped.
+///
+/// ## Panics
+///
+/// This method doesn't create runtime and will panic if it's not within a
+/// runtime. It tries to obtain the current runtime with
+/// [`Runtime::with_current`].
+pub fn try_submit_funded<T: OpCode + 'static, C: 'static>(op: T, funding: C) -> TrySubmit<T, C> {
+    Runtime::with_current(|r| r.try_submit_funded(op, funding))
 }
 
 /// Submit a multishot operation to the current runtime, and return a stream for

@@ -29,7 +29,7 @@ mod macros;
 mod panic;
 
 mod key;
-pub use key::Key;
+pub use key::{Key, OP_FUNDING_WORDS};
 
 mod asyncify;
 pub use asyncify::*;
@@ -296,10 +296,46 @@ impl Proactor {
         op: T,
         extra: Extra,
     ) -> Result<PushEntry<Key<T>, BufResult<usize, T>>, T> {
+        self.try_push_funded_with_extra(op, (), extra)
+    }
+
+    /// Push an operation into the driver like [`try_push`](Proactor::try_push),
+    /// funded by `funding`.
+    ///
+    /// Refused, nothing is allocated, `funding` is dropped and the operation is
+    /// handed back in [`Err`].
+    ///
+    /// Pushed, the funding is kept in the block the operation is kept in, and
+    /// dropped only after the block is freed: when the operation is completed
+    /// and its result taken, or, if its future is dropped while the kernel
+    /// still uses the operation, once the driver has seen it complete. It must
+    /// fit in [`OP_FUNDING_WORDS`] words, aligned to a word at most, which is
+    /// checked when compiling.
+    pub fn try_push_funded<T: sys::OpCode + 'static, C: 'static>(
+        &mut self,
+        op: T,
+        funding: C,
+    ) -> Result<PushEntry<Key<T>, BufResult<usize, T>>, T> {
+        self.try_push_funded_with_extra(op, funding, self.default_extra())
+    }
+
+    /// Push an operation into the driver with user-defined [`Extra`] like
+    /// [`try_push_with_extra`](Proactor::try_push_with_extra), funded by
+    /// `funding` like [`try_push_funded`](Proactor::try_push_funded).
+    ///
+    /// Refused, nothing is allocated, `funding` is dropped and the operation is
+    /// handed back in [`Err`].
+    pub fn try_push_funded_with_extra<T: sys::OpCode + 'static, C: 'static>(
+        &mut self,
+        op: T,
+        funding: C,
+        extra: Extra,
+    ) -> Result<PushEntry<Key<T>, BufResult<usize, T>>, T> {
         if !self.driver.try_reserve_push() {
             return Err(op);
         }
-        let key = Key::try_new(op, extra, self.driver_type())?;
+        let funding = key::Funding::new(funding);
+        let key = Key::try_new_funded(op, extra, self.driver_type(), funding)?;
         Ok(match self.driver.push(key.clone().erase()) {
             Poll::Pending => PushEntry::Pending(key),
             Poll::Ready(res) => {

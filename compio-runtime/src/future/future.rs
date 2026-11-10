@@ -213,33 +213,46 @@ pin_project_lite::pin_project! {
     /// needs to keep the operation as it is pushed, nothing is allocated and
     /// the operation is handed back in [`Err`], where [`Submit`] would abort.
     ///
+    /// Funded by `C`, as returned by [`Runtime::try_submit_funded`], the
+    /// funding is kept with the operation once it is pushed, and dropped only
+    /// after the block the operation is kept in is freed; refused, it is
+    /// dropped. See [`Proactor::try_push_funded`].
+    ///
     /// [`Runtime::try_submit`]: crate::Runtime::try_submit
-    pub struct TrySubmit<T: OpCode> {
+    /// [`Runtime::try_submit_funded`]: crate::Runtime::try_submit_funded
+    pub struct TrySubmit<T: OpCode, C = ()> {
         #[pin]
         submit: Submit<T, ()>,
+        funding: Option<C>,
     }
 }
 
-impl<T: OpCode> TrySubmit<T> {
-    pub(crate) fn new(driver: Rc<RefCell<Proactor>>, op: T) -> Self {
+impl<T: OpCode, C> TrySubmit<T, C> {
+    pub(crate) fn new(driver: Rc<RefCell<Proactor>>, op: T, funding: C) -> Self {
         TrySubmit {
             submit: Submit::new(driver, op),
+            funding: Some(funding),
         }
     }
 }
 
-impl<T: OpCode + 'static> Future for TrySubmit<T> {
+impl<T: OpCode + 'static, C: 'static> Future for TrySubmit<T, C> {
     type Output = Result<BufResult<usize, T>, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut submit = self.project().submit;
+        let fields = self.project();
+        let mut submit = fields.submit;
         let this = submit.as_mut().project();
         if let Some(State::Idle { .. }) = this.state {
             let Some(State::Idle { op }) = this.state.take() else {
                 unreachable!("the state was just seen idle")
             };
+            let funding = fields
+                .funding
+                .take()
+                .expect("the funding is kept until the operation is pushed");
             let extra = cx.as_extra(|| this.driver.borrow().default_extra());
-            let entry = try_submit_raw(&mut this.driver.borrow_mut(), op, extra);
+            let entry = try_submit_raw(&mut this.driver.borrow_mut(), op, funding, extra);
             match entry {
                 Err(op) => return Poll::Ready(Err(op)),
                 Ok(PushEntry::Ready(res)) => return Poll::Ready(Ok(res)),
@@ -256,7 +269,7 @@ impl<T: OpCode + 'static> Future for TrySubmit<T> {
     }
 }
 
-impl<T: OpCode + 'static> FusedFuture for TrySubmit<T> {
+impl<T: OpCode + 'static, C: 'static> FusedFuture for TrySubmit<T, C> {
     fn is_terminated(&self) -> bool {
         self.submit.is_terminated()
     }
