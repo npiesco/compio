@@ -12,6 +12,7 @@ use std::{
     future::Future,
     pin::pin,
     ptr,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
@@ -168,4 +169,52 @@ fn a_spawn_refused_its_block_allocates_nothing() {
     let exe = Executor::new();
     warm(&exe);
     refused_spawn(&exe);
+}
+
+#[test]
+fn a_funded_task_released_on_another_thread_is_freed_and_unfunded_on_its_own() {
+    let exe = Executor::new();
+    warm(&exe);
+
+    let parked = Arc::new(Mutex::new(None::<Waker>));
+    let task = {
+        let parked = parked.clone();
+        std::future::poll_fn(move |cx| {
+            *parked.lock().unwrap() = Some(cx.waker().clone());
+            Poll::<()>::Pending
+        })
+    };
+    let layout = layout_of::<_, Funding>(&task);
+    DROPPED_AT.set(None);
+    let Ok(handle) = exe.try_spawn_funded(task, Funding) else {
+        panic!("the spawn was refused");
+    };
+    exe.tick();
+    // Cancelled and removed: its parked waker is the last reference.
+    drop(handle);
+    exe.tick();
+    let waker = parked
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the task parked its waker");
+    std::thread::spawn(move || drop(waker)).join().unwrap();
+    assert_eq!(
+        DROPPED_AT.get(),
+        None,
+        "the funding is not dropped on another thread, nor leaked"
+    );
+
+    let held = live();
+    exe.tick();
+    assert_eq!(
+        held - live(),
+        layout.size() as isize,
+        "the block is freed on the executor's thread"
+    );
+    assert_eq!(
+        DROPPED_AT.get(),
+        Some(live()),
+        "and the funding dropped there, only after it"
+    );
 }

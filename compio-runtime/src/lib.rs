@@ -250,8 +250,11 @@ impl Runtime {
     ///
     /// Spawned, the funding is kept in the task's block and dropped only after
     /// the block is freed, when the last reference to the task goes. As it may
-    /// not be [`Send`], it is leaked instead, keeping what it holds, if that
-    /// happens on another thread than this runtime's.
+    /// not be [`Send`], it is dropped on this runtime's thread only: if the
+    /// last reference goes on another, the block is handed back here, without
+    /// allocating, and freed as the runtime next runs its tasks, the funding
+    /// dropped after it. Only once the runtime is dropped is such a block freed
+    /// where its last reference goes, and its funding leaked.
     #[track_caller]
     pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
         &self,

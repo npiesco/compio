@@ -11,9 +11,12 @@
     html_favicon_url = "https://github.com/compio-rs/compio-logo/raw/refs/heads/master/generated/colored-bold.svg"
 )]
 
-use std::{any::Any, fmt::Debug, ptr::NonNull, task::Waker};
+use std::{any::Any, fmt::Debug, ptr::NonNull, sync::Arc, task::Waker};
 
-use crate::queue::{TaskId, TaskQueue};
+use crate::{
+    queue::{TaskId, TaskQueue},
+    task::{Funded, Retired},
+};
 
 pub mod console;
 mod join_handle;
@@ -121,6 +124,8 @@ pub(crate) struct Shared {
     sync: SegQueue<TaskId>,
     pending: AtomicUsize,
     queue: SendWrapper<TaskQueue>,
+    /// The blocks of funded tasks released on other threads, to free here.
+    retired: Arc<Retired>,
 }
 
 impl Shared {
@@ -155,8 +160,10 @@ impl Executor {
 
     /// Create a new executor with config.
     pub fn with_config(mut config: ExecutorConfig) -> Self {
+        let waker = config.waker.take();
         let ptr = Box::into_raw(Box::new(Shared {
-            waker: config.waker.take(),
+            retired: Arc::new(Retired::new(waker.clone())),
+            waker,
             sync: SegQueue::new(),
             pending: AtomicUsize::new(0),
             queue: SendWrapper::new(TaskQueue::new(config.local_queue_size)),
@@ -202,8 +209,11 @@ impl Executor {
     ///
     /// Spawned, the funding is kept in the task's block and dropped only after
     /// the block is freed, when the last reference to the task goes. As it may
-    /// not be [`Send`], it is leaked instead, keeping what it holds, if that
-    /// happens on another thread than this executor's.
+    /// not be [`Send`], it is dropped on this executor's thread only: if the
+    /// last reference goes on another, the block is handed back here, without
+    /// allocating, and freed by the next [`tick`](Self::tick), the funding
+    /// dropped after it. Only once the executor is dropped is such a block
+    /// freed where its last reference goes, and its funding leaked.
     #[track_caller]
     pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
         &self,
@@ -227,6 +237,10 @@ impl Executor {
         let tracker = shared.queue.tracker();
         // SAFETY: Executor cannot be sent to ther thread
         let queue = unsafe { shared.queue.get_unchecked() };
+        let funding = Funded {
+            funding,
+            retired: shared.retired.clone(),
+        };
         match queue.try_insert(self.ptr, tracker, fut, funding, meta) {
             Ok(task) => Ok(JoinHandle::new(task)),
             Err((fut, _)) => Err(fut),
@@ -245,6 +259,7 @@ impl Executor {
     pub fn tick(&self) -> bool {
         let queue = self.queue();
 
+        self.shared().retired.free();
         self.shared().drain_sync(queue);
 
         for id in queue.iter_hot().take(self.config.max_interval as _) {
@@ -284,6 +299,7 @@ impl Executor {
 
         while self.shared().sync.pop().is_some() {}
         unsafe { self.queue().clear() };
+        self.shared().retired.free();
     }
 
     #[inline(always)]
@@ -301,6 +317,7 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         self.clear();
+        self.shared().retired.close();
         unsafe { drop(Box::from_raw(self.ptr.as_ptr())) };
     }
 }

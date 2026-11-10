@@ -3,7 +3,12 @@ use std::{fmt::Debug, ptr::NonNull};
 use compio_send_wrapper::SendWrapper;
 use slotmap::new_key_type;
 
-use crate::{Shared, console::SpawnMeta, task::Task, util::assert_not_impl};
+use crate::{
+    Shared,
+    console::SpawnMeta,
+    task::{Task, TaskFunding},
+    util::assert_not_impl,
+};
 
 new_key_type! { pub struct TaskId; }
 
@@ -161,7 +166,7 @@ impl TaskQueue {
     /// the allocator refuses the memory it takes: room for it in the map, or
     /// its block. Refused, nothing is allocated and the future and its funding
     /// are handed back.
-    pub fn try_insert<F: Future + 'static, C: 'static>(
+    pub fn try_insert<F: Future + 'static, C: TaskFunding>(
         &self,
         shared: NonNull<Shared>,
         tracker: SendWrapper<()>,

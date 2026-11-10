@@ -6,7 +6,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::{self, NonNull, drop_in_place},
-    sync::atomic::Ordering::*,
+    sync::{Arc, atomic::Ordering::*},
     task::{Context, Poll, Waker, ready},
 };
 
@@ -51,7 +51,7 @@ impl Debug for Task {
 /// `Header`.
 ///
 /// `funding` pays for the allocation: it is dropped only after the allocation
-/// is freed, by [`TaskAlloc::dealloc`].
+/// is freed, by [`TaskAlloc::dealloc`], on the thread the task was spawned on.
 #[repr(C)]
 struct TaskAlloc<F: Future, C = ()> {
     header: Header,
@@ -65,7 +65,115 @@ struct TaskAlloc<F: Future, C = ()> {
 ///
 /// [`Executor::try_spawn_funded`]: crate::Executor::try_spawn_funded
 pub fn task_layout<F: Future + 'static, C: 'static>() -> Layout {
-    Layout::new::<TaskAlloc<F, C>>()
+    Layout::new::<TaskAlloc<F, Funded<C>>>()
+}
+
+/// What a task's block keeps besides its future, dropped only after the block
+/// is freed: nothing for a plain spawn, the funding of a funded one.
+pub(crate) trait TaskFunding: 'static {
+    /// Where the block goes to be freed on its executor's thread, if its last
+    /// reference goes on another.
+    fn retired(&self) -> Option<&Arc<Retired>>;
+}
+
+impl TaskFunding for () {
+    fn retired(&self) -> Option<&Arc<Retired>> {
+        None
+    }
+}
+
+/// The funding of a funded spawn, with its way back to the executor's thread:
+/// it may not be [`Send`], so it is dropped only there.
+pub(crate) struct Funded<C> {
+    pub(crate) funding: C,
+    pub(crate) retired: Arc<Retired>,
+}
+
+impl<C: 'static> TaskFunding for Funded<C> {
+    fn retired(&self) -> Option<&Arc<Retired>> {
+        Some(&self.retired)
+    }
+}
+
+/// The blocks of funded tasks whose last reference went on another thread than
+/// their executor's, linked through the slots of their dead wakers, until the
+/// executor frees them on its own thread, each before its funding is dropped.
+pub(crate) struct Retired {
+    head: AtomicPtr<Header>,
+    /// Wakes the executor's thread to free them.
+    waker: Option<Waker>,
+}
+
+impl Retired {
+    pub(crate) fn new(waker: Option<Waker>) -> Self {
+        Self {
+            head: AtomicPtr::new(ptr::null_mut()),
+            waker,
+        }
+    }
+
+    /// The head once the executor is gone: a block retired after that is freed
+    /// where its last reference goes, and its funding leaked.
+    fn closed() -> *mut Header {
+        NonNull::<Header>::dangling().as_ptr()
+    }
+
+    /// Hands `header`'s block over to the executor's thread, unless it is gone.
+    /// Allocates nothing.
+    ///
+    /// # Safety
+    ///
+    /// No reference to the block is left, and its waker is dropped or leaked.
+    unsafe fn push(&self, header: NonNull<Header>) -> bool {
+        let mut head = self.head.load(Acquire);
+        loop {
+            if head == Self::closed() {
+                return false;
+            }
+            // SAFETY: The block is unreferenced, and its waker's slot dead.
+            unsafe { header.as_ref() }
+                .waker
+                .with_mut(|slot| unsafe { slot.cast::<*mut Header>().write(head) });
+            match self
+                .head
+                .compare_exchange_weak(head, header.as_ptr(), Release, Acquire)
+            {
+                Ok(_) => break,
+                Err(now) => head = now,
+            }
+        }
+        if let Some(waker) = &self.waker {
+            waker.wake_by_ref();
+        }
+        true
+    }
+
+    /// Frees the blocks retired so far. Called on the executor's thread only.
+    pub(crate) fn free(&self) {
+        self.take(ptr::null_mut());
+    }
+
+    /// Frees the blocks retired so far, and leaves those retired after where
+    /// they go. Called on the executor's thread only, as it is dropped.
+    pub(crate) fn close(&self) {
+        self.take(Self::closed());
+    }
+
+    fn take(&self, head: *mut Header) {
+        let mut next = self.head.swap(head, AcqRel);
+        debug_assert_ne!(next, Self::closed(), "freed after the executor is gone");
+        while let Some(header) = NonNull::new(next) {
+            // SAFETY: The block was pushed whole, its link written before it,
+            // and is freed only here, once, on the thread it belongs to.
+            unsafe {
+                next = header
+                    .as_ref()
+                    .waker
+                    .with(|slot| slot.cast::<*mut Header>().read());
+                (header.as_ref().vtable.dealloc)(header);
+            }
+        }
+    }
 }
 
 struct Header {
@@ -91,7 +199,7 @@ struct TaskVtable {
     drop_future: unsafe fn(NonNull<Header>, bool),
 }
 
-impl<F: Future + 'static, C: 'static> TaskAlloc<F, C> {
+impl<F: Future + 'static, C: TaskFunding> TaskAlloc<F, C> {
     const FUT_OFFSET: usize = offset_of!(Self, future);
     const VTABLE: &'static TaskVtable = &TaskVtable {
         dealloc: Self::dealloc,
@@ -180,15 +288,29 @@ impl<F: Future + 'static, C: 'static> TaskAlloc<F, C> {
         // The funding pays for the allocation, so it is taken out first and
         // dropped only once the allocation is freed. It may not be `Send`, so
         // it is dropped only on the thread the task was spawned on: if the
-        // last reference goes on another, it is leaked, keeping what it holds.
+        // last reference goes on another, the block is handed back to that
+        // thread's executor, which frees it and drops the funding after. Only
+        // once the executor is gone is the block freed here and the funding
+        // leaked, keeping what it holds.
         //
         // SAFETY: The caller guarantees that the pointer is valid and properly
         // aligned for `TaskAlloc<F, C>`, and that no other reference to
         // the allocation exists. The funding is read out once, here, and the
         // box does not drop it again, as it is kept in a `ManuallyDrop`.
         let alloc = header.as_ptr().cast::<TaskAlloc<F, C>>();
-        let funding = unsafe { ptr::read(&raw const (*alloc).funding) };
         let owner = unsafe { (*alloc).header.tracker.valid() };
+        if !owner {
+            // Held apart from the block, which the executor may free as soon
+            // as it is pushed.
+            let retired = unsafe { (*alloc).funding.retired() }.cloned();
+            if let Some(retired) = retired {
+                // SAFETY: Unreferenced, as the caller guarantees.
+                if unsafe { retired.push(header) } {
+                    return;
+                }
+            }
+        }
+        let funding = unsafe { ptr::read(&raw const (*alloc).funding) };
         drop(unsafe { Box::from_raw(alloc) });
         if owner {
             drop(ManuallyDrop::into_inner(funding));
@@ -197,7 +319,7 @@ impl<F: Future + 'static, C: 'static> TaskAlloc<F, C> {
 }
 
 impl Header {
-    fn new<F: Future + 'static, C: 'static, const N: usize>(
+    fn new<F: Future + 'static, C: TaskFunding, const N: usize>(
         id: TaskId,
         shared: NonNull<Shared>,
         tracker: SendWrapper<()>,
@@ -243,7 +365,7 @@ impl Task {
     /// future and its funding are handed back.
     ///
     /// The funding is dropped only after the block is freed.
-    pub fn try_new<F: Future + 'static, C: 'static, const N: usize>(
+    pub fn try_new<F: Future + 'static, C: TaskFunding, const N: usize>(
         id: TaskId,
         shared: NonNull<Shared>,
         tracker: SendWrapper<()>,
@@ -252,7 +374,7 @@ impl Task {
         meta: SpawnMeta,
     ) -> Result<[Task; N], (F, C)> {
         // SAFETY: The layout is not zero-sized, as it holds the header.
-        let alloc = unsafe { alloc(task_layout::<F, C>()) }.cast::<TaskAlloc<F, C>>();
+        let alloc = unsafe { alloc(Layout::new::<TaskAlloc<F, C>>()) }.cast::<TaskAlloc<F, C>>();
         let Some(alloc) = NonNull::new(alloc) else {
             return Err((future, funding));
         };
