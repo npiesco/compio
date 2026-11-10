@@ -390,11 +390,13 @@ impl ErasedKey {
     ///
     /// [`take_result`]: Self::take_result
     pub(crate) fn downgrade(&self) -> WeakKey {
-        // The funding's place is derived from the pointer to the whole block,
-        // as it is used once the op is gone.
-        let block = self.inner.as_ptr();
-        let at = (&raw const self.borrow().funding).addr() - block.addr();
-        let funding = block.cast_mut().cast::<u8>().wrapping_add(at).cast();
+        // The funding's place is projected from the op's without borrowing it,
+        // so that a key is downgraded while its op is borrowed as well. It is
+        // used once the op is gone, while the block lasts.
+        let op = self.inner.as_data_ptr();
+        // SAFETY: `op` points into the live block, and the place is projected
+        // without making a reference.
+        let funding = unsafe { &raw mut (*op).funding };
         WeakKey {
             inner: ManuallyDrop::new(self.inner.downgrade()),
             // SAFETY: a place in a live block is not null
@@ -649,5 +651,32 @@ impl Deref for BorrowedKey {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(all(test, unix))]
+mod test {
+    use std::os::fd::OwnedFd;
+
+    use crate::{Proactor, PushEntry, op::Read};
+
+    #[test]
+    fn a_key_is_downgraded_while_its_op_is_borrowed() {
+        let mut driver = Proactor::new().unwrap();
+        let (r, _w) = std::io::pipe().unwrap();
+        let read = Read::new(OwnedFd::from(r), Vec::<u8>::with_capacity(16));
+        let PushEntry::Pending(key) = driver.push(read) else {
+            panic!("the read completed with nothing to read");
+        };
+        let op = key.borrow();
+        let weak = key.downgrade();
+        assert_eq!(
+            weak.funding.as_ptr().cast_const(),
+            &raw const op.funding,
+            "the token takes the funding from the op's place"
+        );
+        drop(op);
+        drop(weak);
+        let _ = driver.cancel(key);
     }
 }
