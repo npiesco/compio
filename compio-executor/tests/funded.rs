@@ -12,7 +12,10 @@ use std::{
     future::Future,
     pin::pin,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
@@ -176,28 +179,9 @@ fn a_funded_task_released_on_another_thread_is_freed_and_unfunded_on_its_own() {
     let exe = Executor::new();
     warm(&exe);
 
-    let parked = Arc::new(Mutex::new(None::<Waker>));
-    let task = {
-        let parked = parked.clone();
-        std::future::poll_fn(move |cx| {
-            *parked.lock().unwrap() = Some(cx.waker().clone());
-            Poll::<()>::Pending
-        })
-    };
-    let layout = layout_of::<_, Funding>(&task);
     DROPPED_AT.set(None);
-    let Ok(handle) = exe.try_spawn_funded(task, Funding) else {
-        panic!("the spawn was refused");
-    };
-    exe.tick();
     // Cancelled and removed: its parked waker is the last reference.
-    drop(handle);
-    exe.tick();
-    let waker = parked
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the task parked its waker");
+    let (waker, layout) = parked_alone(&exe, Funding);
     std::thread::spawn(move || drop(waker)).join().unwrap();
     assert_eq!(
         DROPPED_AT.get(),
@@ -216,6 +200,139 @@ fn a_funded_task_released_on_another_thread_is_freed_and_unfunded_on_its_own() {
         DROPPED_AT.get(),
         Some(live()),
         "and the funding dropped there, only after it"
+    );
+}
+
+/// Spawns a task funded by `funding` that parks its waker, and cancels it,
+/// leaving that waker as the last reference to its block: returns the waker and
+/// the layout of the block.
+fn parked_alone<C: 'static>(exe: &Executor, funding: C) -> (Waker, Layout) {
+    let parked = Arc::new(Mutex::new(None::<Waker>));
+    let task = {
+        let parked = parked.clone();
+        std::future::poll_fn(move |cx| {
+            *parked.lock().unwrap() = Some(cx.waker().clone());
+            Poll::<()>::Pending
+        })
+    };
+    let layout = layout_of::<_, C>(&task);
+    let Ok(handle) = exe.try_spawn_funded(task, funding) else {
+        panic!("the spawn was refused");
+    };
+    exe.tick();
+    drop(handle);
+    exe.tick();
+    let waker = parked
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the task parked its waker");
+    (waker, layout)
+}
+
+#[test]
+fn a_funded_task_released_on_another_thread_after_its_executor_is_dropped_is_freed_on_its_own() {
+    let exe = Executor::new();
+    let next = Executor::new();
+    warm(&exe);
+    warm(&next);
+
+    DROPPED_AT.set(None);
+    let (waker, layout) = parked_alone(&exe, Funding);
+    drop(exe);
+    assert_eq!(DROPPED_AT.get(), None, "the waker still holds the block");
+
+    std::thread::spawn(move || drop(waker)).join().unwrap();
+    assert_eq!(
+        DROPPED_AT.get(),
+        None,
+        "the funding is not dropped on another thread, nor leaked"
+    );
+
+    let held = live();
+    next.tick();
+    assert_eq!(
+        DROPPED_AT.get(),
+        Some(held - layout.size() as isize),
+        "the block is freed on the dropped executor's thread as another there ticks, and the \
+         funding dropped there only after it"
+    );
+}
+
+/// The bytes live on its thread as a [`Homed`] was dropped.
+static HOMED_DROPPED_AT: Mutex<Option<isize>> = Mutex::new(None);
+
+/// Pays for a task: dropped, it records the bytes live on its thread by then.
+struct Homed;
+
+impl Drop for Homed {
+    fn drop(&mut self) {
+        *HOMED_DROPPED_AT.lock().unwrap() = LIVE.try_with(Cell::get).ok();
+    }
+}
+
+#[test]
+fn a_funded_task_released_on_another_thread_after_its_executor_is_dropped_is_freed_as_its_thread_exits()
+ {
+    let (send, parked) = std::sync::mpsc::channel();
+    let (exit, exiting) = std::sync::mpsc::channel::<()>();
+    let home = std::thread::spawn(move || {
+        let exe = Executor::new();
+        let (waker, layout) = parked_alone(&exe, Homed);
+        drop(exe);
+        send.send(waker).unwrap();
+        exiting.recv().unwrap();
+        (live(), layout)
+    });
+    let waker = parked.recv().unwrap();
+    let before = live();
+    drop(waker);
+    assert_eq!(live(), before, "the block is not freed on another thread");
+    assert_eq!(
+        *HOMED_DROPPED_AT.lock().unwrap(),
+        None,
+        "the funding is not dropped on another thread"
+    );
+
+    exit.send(()).unwrap();
+    let (exiting, layout) = home.join().unwrap();
+    let dropped_at = HOMED_DROPPED_AT
+        .lock()
+        .unwrap()
+        .expect("the funding is dropped as its thread exits");
+    assert!(
+        dropped_at <= exiting - layout.size() as isize,
+        "the block is freed on its thread as it exits, before the funding is dropped"
+    );
+}
+
+/// Whether a [`Stranded`] was dropped.
+static STRANDED_DROPPED: AtomicBool = AtomicBool::new(false);
+
+/// Pays for a task: dropped, it records that it was.
+struct Stranded;
+
+impl Drop for Stranded {
+    fn drop(&mut self) {
+        STRANDED_DROPPED.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn a_funded_task_released_after_its_thread_exited_is_freed_where_it_goes_its_funding_kept() {
+    let (waker, layout) = std::thread::spawn(|| parked_alone(&Executor::new(), Stranded))
+        .join()
+        .unwrap();
+    let before = live();
+    drop(waker);
+    assert_eq!(
+        before - live(),
+        layout.size() as isize,
+        "the block is freed where its last reference goes"
+    );
+    assert!(
+        !STRANDED_DROPPED.load(Ordering::SeqCst),
+        "the funding is not dropped on a thread not its own"
     );
 }
 

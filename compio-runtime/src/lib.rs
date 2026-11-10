@@ -253,8 +253,11 @@ impl Runtime {
     /// not be [`Send`], it is dropped on this runtime's thread only: if the
     /// last reference goes on another, the block is handed back here, without
     /// allocating, and freed as the runtime next runs its tasks, the funding
-    /// dropped after it. Only once the runtime is dropped is such a block freed
-    /// where its last reference goes, and its funding leaked.
+    /// dropped after it. Once the runtime is dropped, such a block is still
+    /// handed back to its thread, freed as another runtime there runs its
+    /// tasks, or as the thread exits. Only once that thread has exited is such
+    /// a block freed where its last reference goes, and its funding, with no
+    /// thread left it may be dropped on, leaked.
     ///
     /// The task is not reported to the console: its span would be allocated by
     /// the subscriber, outside of the block and of what the funding covers.

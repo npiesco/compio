@@ -1,6 +1,7 @@
 use std::{
     alloc::{Layout, alloc},
     array,
+    cell::Cell,
     fmt::Debug,
     mem::{ManuallyDrop, MaybeUninit, offset_of},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -98,10 +99,16 @@ impl<C: 'static> TaskFunding for Funded<C> {
 /// The blocks of funded tasks whose last reference went on another thread than
 /// their executor's, linked through the slots of their dead wakers, until the
 /// executor frees them on its own thread, each before its funding is dropped.
+///
+/// Once the executor is dropped, the thread's [`Orphans`] keep freeing them
+/// there, until the thread exits.
 pub(crate) struct Retired {
     head: AtomicPtr<Header>,
     /// Wakes the executor's thread to free them.
     waker: Option<Waker>,
+    /// The next of the thread's [`Orphans`], once the executor is dropped.
+    /// Read and written on that thread only.
+    next_orphan: AtomicPtr<Retired>,
 }
 
 impl Retired {
@@ -109,11 +116,13 @@ impl Retired {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
             waker,
+            next_orphan: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    /// The head once the executor is gone: a block retired after that is freed
-    /// where its last reference goes, and its funding leaked.
+    /// The head once the executor's thread has exited: a block retired after
+    /// that is freed where its last reference goes, and its funding, which may
+    /// not be [`Send`], is leaked, as no thread it may be dropped on is left.
     fn closed() -> *mut Header {
         NonNull::<Header>::dangling().as_ptr()
     }
@@ -154,14 +163,37 @@ impl Retired {
     }
 
     /// Frees the blocks retired so far, and leaves those retired after where
-    /// they go. Called on the executor's thread only, as it is dropped.
+    /// they go. Called on the executor's thread only, as it exits.
     pub(crate) fn close(&self) {
         self.take(Self::closed());
     }
 
+    /// Hands the blocks still to retire over to this thread's [`Orphans`] as
+    /// the executor is dropped, to be freed as another executor here ticks, or
+    /// as the thread exits, each before its funding is dropped. Allocates
+    /// nothing. Called on the executor's thread only.
+    pub(crate) fn orphan(this: &Arc<Self>) {
+        // Only funded tasks, spawned on this thread, add references: one the
+        // executor holds alone is retired by none, and none will be.
+        if Arc::strong_count(this) == 1 {
+            return;
+        }
+        let adopted = ORPHANS.try_with(|orphans| {
+            this.next_orphan.store(orphans.0.get().cast_mut(), Relaxed);
+            orphans.0.set(Arc::into_raw(this.clone()));
+        });
+        if adopted.is_err() {
+            this.close();
+        }
+    }
+
     fn take(&self, head: *mut Header) {
         let mut next = self.head.swap(head, AcqRel);
-        debug_assert_ne!(next, Self::closed(), "freed after the executor is gone");
+        debug_assert_ne!(
+            next,
+            Self::closed(),
+            "freed after the executor's thread exited"
+        );
         while let Some(header) = NonNull::new(next) {
             // SAFETY: The block was pushed whole, its link written before it,
             // and is freed only here, once, on the thread it belongs to.
@@ -172,6 +204,71 @@ impl Retired {
                     .with(|slot| slot.cast::<*mut Header>().read());
                 (header.as_ref().vtable.dealloc)(header);
             }
+        }
+    }
+}
+
+std::thread_local! {
+    /// The [`Retired`] of the executors dropped on this thread whose funded
+    /// tasks are still referenced, linked through their `next_orphan`.
+    static ORPHANS: Orphans = const { Orphans(Cell::new(ptr::null())) };
+}
+
+/// The retired lists of a thread's dropped executors, each held by one
+/// reference from [`Arc::into_raw`].
+pub(crate) struct Orphans(Cell<*const Retired>);
+
+impl Orphans {
+    /// Frees the blocks retired to this thread's dropped executors so far,
+    /// releasing each list no task can retire to any more. Allocates nothing.
+    pub(crate) fn free() {
+        let _ = ORPHANS.try_with(|orphans| {
+            let mut next = orphans.0.get();
+            while !next.is_null() {
+                // SAFETY: Held by the list's reference, and only on this
+                // thread.
+                let held = ManuallyDrop::new(unsafe { Arc::from_raw(next) });
+                held.free();
+                let after = held.next_orphan.load(Relaxed);
+                if Arc::strong_count(&held) == 1 {
+                    orphans.unlink(next, after);
+                    drop(ManuallyDrop::into_inner(held));
+                }
+                next = after.cast_const();
+            }
+        });
+    }
+
+    /// Unlinks `retired`, followed by `after`, found again from the head, as
+    /// an executor dropped by a funding as it was freed may have been linked
+    /// in front of it since.
+    fn unlink(&self, retired: *const Retired, after: *mut Retired) {
+        let mut link = self.0.get();
+        if link == retired {
+            self.0.set(after.cast_const());
+            return;
+        }
+        while !link.is_null() {
+            // SAFETY: Linked, so held by the list's reference.
+            let before = unsafe { &*link };
+            let next = before.next_orphan.load(Relaxed).cast_const();
+            if next == retired {
+                before.next_orphan.store(after, Relaxed);
+                return;
+            }
+            link = next;
+        }
+    }
+}
+
+impl Drop for Orphans {
+    fn drop(&mut self) {
+        let mut next = self.0.get();
+        while !next.is_null() {
+            // SAFETY: The list's own reference, released once, on this thread.
+            let retired = unsafe { Arc::from_raw(next) };
+            retired.close();
+            next = retired.next_orphan.load(Relaxed).cast_const();
         }
     }
 }
@@ -289,9 +386,11 @@ impl<F: Future + 'static, C: TaskFunding> TaskAlloc<F, C> {
         // dropped only once the allocation is freed. It may not be `Send`, so
         // it is dropped only on the thread the task was spawned on: if the
         // last reference goes on another, the block is handed back to that
-        // thread's executor, which frees it and drops the funding after. Only
-        // once the executor is gone is the block freed here and the funding
-        // leaked, keeping what it holds.
+        // thread's executor, which frees it and drops the funding after. Once
+        // the executor is gone, that thread's other executors free it as they
+        // tick, or the thread as it exits. Only once that thread has exited is
+        // the block freed here and the funding leaked, keeping what it holds,
+        // as there is no thread left it may be dropped on.
         //
         // SAFETY: The caller guarantees that the pointer is valid and properly
         // aligned for `TaskAlloc<F, C>`, and that no other reference to

@@ -15,7 +15,7 @@ use std::{any::Any, fmt::Debug, ptr::NonNull, sync::Arc, task::Waker};
 
 use crate::{
     queue::{TaskId, TaskQueue},
-    task::{Funded, Retired},
+    task::{Funded, Orphans, Retired},
 };
 
 pub mod console;
@@ -212,8 +212,11 @@ impl Executor {
     /// not be [`Send`], it is dropped on this executor's thread only: if the
     /// last reference goes on another, the block is handed back here, without
     /// allocating, and freed by the next [`tick`](Self::tick), the funding
-    /// dropped after it. Only once the executor is dropped is such a block
-    /// freed where its last reference goes, and its funding leaked.
+    /// dropped after it. Once the executor is dropped, such a block is still
+    /// handed back to its thread, freed as another executor there ticks, or as
+    /// the thread exits. Only once that thread has exited is such a block
+    /// freed where its last reference goes, and its funding, with no thread
+    /// left it may be dropped on, leaked.
     ///
     /// The task is not reported to the console: its span would be allocated by
     /// the subscriber, outside of the block and of what the funding covers.
@@ -249,6 +252,7 @@ impl Executor {
         let queue = self.queue();
 
         self.shared().retired.free();
+        Orphans::free();
         self.shared().drain_sync(queue);
 
         for id in queue.iter_hot().take(self.config.max_interval as _) {
@@ -306,7 +310,7 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         self.clear();
-        self.shared().retired.close();
+        Retired::orphan(&self.shared().retired);
         unsafe { drop(Box::from_raw(self.ptr.as_ptr())) };
     }
 }
