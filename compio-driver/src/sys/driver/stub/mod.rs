@@ -57,6 +57,11 @@ impl Driver {
         StubExtra::new()
     }
 
+    /// Reserve room to track one more operation: the stub tracks none.
+    pub fn try_reserve_push(&mut self) -> bool {
+        true
+    }
+
     pub fn push(&mut self, _: ErasedKey) -> Poll<io::Result<usize>> {
         Poll::Ready(Err(stub_error()))
     }

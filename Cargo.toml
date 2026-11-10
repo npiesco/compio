@@ -97,3 +97,7 @@ rustix = "1.1.4"
 debug = true
 lto = true
 codegen-units = 1
+
+# `ThinCell::try_new` lets the driver refuse an operation's block instead of aborting.
+[patch.crates-io]
+thin-cell = { git = "https://github.com/npiesco/thin-cell", branch = "fallible-op-block" }

@@ -387,6 +387,15 @@ impl Driver {
         }
     }
 
+    /// Reserve room to track one more operation in flight, so that pushing it
+    /// allocates nothing more for that: `false` if the allocator refuses it.
+    ///
+    /// An operation the kernel cannot run, which falls back to the blocking
+    /// pool, still allocates its task there.
+    pub fn try_reserve_push(&mut self) -> bool {
+        self.in_flight.try_reserve(1).is_ok()
+    }
+
     pub fn push(&mut self, key: ErasedKey) -> Poll<io::Result<usize>> {
         instrument!(compio_log::Level::TRACE, "push", ?key);
         let mut op_entry = key.borrow().create_entry::<false>();

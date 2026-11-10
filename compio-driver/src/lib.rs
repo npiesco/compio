@@ -272,6 +272,43 @@ impl Proactor {
         }
     }
 
+    /// Push an operation into the driver like [`push`](Proactor::push), unless
+    /// the allocator refuses the memory the driver needs to keep it: the block
+    /// it is kept in, or room to track it in flight.
+    ///
+    /// Refused, nothing is allocated and the operation is handed back in
+    /// [`Err`], where [`push`](Proactor::push) would abort.
+    pub fn try_push<T: sys::OpCode + 'static>(
+        &mut self,
+        op: T,
+    ) -> Result<PushEntry<Key<T>, BufResult<usize, T>>, T> {
+        self.try_push_with_extra(op, self.default_extra())
+    }
+
+    /// Push an operation into the driver with user-defined [`Extra`] like
+    /// [`push_with_extra`](Proactor::push_with_extra), unless the allocator
+    /// refuses the memory the driver needs to keep it.
+    ///
+    /// Refused, nothing is allocated and the operation is handed back in
+    /// [`Err`].
+    pub fn try_push_with_extra<T: sys::OpCode + 'static>(
+        &mut self,
+        op: T,
+        extra: Extra,
+    ) -> Result<PushEntry<Key<T>, BufResult<usize, T>>, T> {
+        if !self.driver.try_reserve_push() {
+            return Err(op);
+        }
+        let key = Key::try_new(op, extra, self.driver_type())?;
+        Ok(match self.driver.push(key.clone().erase()) {
+            Poll::Pending => PushEntry::Pending(key),
+            Poll::Ready(res) => {
+                key.set_result(res);
+                PushEntry::Ready(key.take_result())
+            }
+        })
+    }
+
     /// Flush the pushed operations to the kernel. It is roughly equivalent to
     /// calling [`poll`](Proactor::poll) with `Some(Duration::ZERO)` on
     /// io-uring, but is only needed if you're waiting on the driver fd with an

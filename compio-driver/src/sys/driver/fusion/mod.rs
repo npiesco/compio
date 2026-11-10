@@ -93,6 +93,14 @@ impl Driver {
         }
     }
 
+    /// Reserve room to track one more operation in the fused driver.
+    pub fn try_reserve_push(&mut self) -> bool {
+        match &mut self.fuse {
+            FuseDriver::Poll(driver) => driver.try_reserve_push(),
+            FuseDriver::IoUring(driver) => driver.try_reserve_push(),
+        }
+    }
+
     pub fn push(&mut self, op: ErasedKey) -> Poll<io::Result<usize>> {
         match &mut self.fuse {
             FuseDriver::Poll(driver) => driver.push(op),

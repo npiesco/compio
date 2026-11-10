@@ -15,7 +15,7 @@ use futures_util::future::FusedFuture;
 
 use crate::{
     CancelToken,
-    future::{poll_task, poll_task_with_extra, submit_raw},
+    future::{poll_task, poll_task_with_extra, submit_raw, try_submit_raw},
     waker::{get_ext, get_waker},
 };
 
@@ -203,6 +203,62 @@ impl<T: OpCode + 'static> Future for Submit<T, Extra> {
                 }
             }
         }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Returned [`Future`] for [`Runtime::try_submit`].
+    ///
+    /// Like [`Submit`], but if the allocator refuses the memory the driver
+    /// needs to keep the operation as it is pushed, nothing is allocated and
+    /// the operation is handed back in [`Err`], where [`Submit`] would abort.
+    ///
+    /// [`Runtime::try_submit`]: crate::Runtime::try_submit
+    pub struct TrySubmit<T: OpCode> {
+        #[pin]
+        submit: Submit<T, ()>,
+    }
+}
+
+impl<T: OpCode> TrySubmit<T> {
+    pub(crate) fn new(driver: Rc<RefCell<Proactor>>, op: T) -> Self {
+        TrySubmit {
+            submit: Submit::new(driver, op),
+        }
+    }
+}
+
+impl<T: OpCode + 'static> Future for TrySubmit<T> {
+    type Output = Result<BufResult<usize, T>, T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut submit = self.project().submit;
+        let this = submit.as_mut().project();
+        if let Some(State::Idle { .. }) = this.state {
+            let Some(State::Idle { op }) = this.state.take() else {
+                unreachable!("the state was just seen idle")
+            };
+            let extra = cx.as_extra(|| this.driver.borrow().default_extra());
+            let entry = try_submit_raw(&mut this.driver.borrow_mut(), op, extra);
+            match entry {
+                Err(op) => return Poll::Ready(Err(op)),
+                Ok(PushEntry::Ready(res)) => return Poll::Ready(Ok(res)),
+                Ok(PushEntry::Pending(key)) => {
+                    if let Some(cancel) = cx.get_cancel() {
+                        cancel.register(&key);
+                    }
+
+                    *this.state = Some(State::submitted(key))
+                }
+            }
+        }
+        submit.poll(cx).map(Ok)
+    }
+}
+
+impl<T: OpCode + 'static> FusedFuture for TrySubmit<T> {
+    fn is_terminated(&self) -> bool {
+        self.submit.is_terminated()
     }
 }
 

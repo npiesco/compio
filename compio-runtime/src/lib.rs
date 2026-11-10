@@ -292,6 +292,15 @@ impl Runtime {
         Submit::new(self.driver.clone(), op)
     }
 
+    /// Submit an operation to the runtime, unless the allocator refuses the
+    /// memory the driver needs to keep it: refused, nothing is allocated and
+    /// the future hands the operation back in [`Err`].
+    ///
+    /// You only need this when authoring your own [`OpCode`].
+    pub fn try_submit<T: OpCode + 'static>(&self, op: T) -> TrySubmit<T> {
+        TrySubmit::new(self.driver.clone(), op)
+    }
+
     /// Submit a multishot operation to the runtime.
     ///
     /// You only need this when authoring your own [`OpCode`].
@@ -604,6 +613,19 @@ pub fn spawn_blocking_at<T: Send + 'static>(
 /// [`Runtime::with_current`].
 pub fn submit<T: OpCode + 'static>(op: T) -> Submit<T> {
     Runtime::with_current(|r| r.submit(op))
+}
+
+/// Submit an operation to the current runtime, and return a future for it that
+/// hands the operation back in [`Err`], allocating nothing, if the allocator
+/// refuses the memory the driver needs to keep it.
+///
+/// ## Panics
+///
+/// This method doesn't create runtime and will panic if it's not within a
+/// runtime. It tries to obtain the current runtime with
+/// [`Runtime::with_current`].
+pub fn try_submit<T: OpCode + 'static>(op: T) -> TrySubmit<T> {
+    Runtime::with_current(|r| r.try_submit(op))
 }
 
 /// Submit a multishot operation to the current runtime, and return a stream for

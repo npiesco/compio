@@ -93,6 +93,13 @@ impl Driver {
         key.borrow().carrier.cancel(optr.cast()).ok();
     }
 
+    /// Reserve room to track one more operation: an overlapped operation is
+    /// tracked by the kernel alone, so this is always `true`; an event or
+    /// blocking operation still allocates as it is pushed.
+    pub fn try_reserve_push(&mut self) -> bool {
+        true
+    }
+
     pub fn push(&mut self, key: ErasedKey) -> Poll<io::Result<usize>> {
         instrument!(compio_log::Level::TRACE, "push", ?key);
         trace!("push RawOp");

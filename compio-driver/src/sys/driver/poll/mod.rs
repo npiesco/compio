@@ -292,6 +292,13 @@ impl Driver {
         }
     }
 
+    /// Reserve room to track one more operation: nothing is reserved here, so
+    /// this is always `true`; the queues of the descriptors an operation waits
+    /// on still grow as it is pushed.
+    pub fn try_reserve_push(&mut self) -> bool {
+        true
+    }
+
     pub fn push(&mut self, key: ErasedKey) -> Poll<io::Result<usize>> {
         instrument!(compio_log::Level::TRACE, "push", ?key);
         match { key.borrow().carrier.pre_submit()? } {

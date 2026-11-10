@@ -172,6 +172,22 @@ impl<T: OpCode + 'static> Key<T> {
         }
     }
 
+    /// Create [`RawOp`] and get the [`Key`] to it, unless the allocator refuses
+    /// the block it is kept in: refused, nothing is allocated and `op` is
+    /// handed back.
+    pub(crate) fn try_new(
+        op: T,
+        extra: impl Into<Extra>,
+        driver_ty: DriverType,
+    ) -> Result<Self, T> {
+        let erased = ErasedKey::try_new(op, extra.into(), driver_ty)?;
+
+        Ok(Self {
+            erased,
+            _p: std::marker::PhantomData,
+        })
+    }
+
     pub(crate) fn set_extra(&self, extra: impl Into<Extra>) {
         self.borrow().extra = extra.into();
     }
@@ -216,7 +232,31 @@ impl ErasedKey {
             result: PushEntry::Pending(None),
             carrier: Carrier::new(op, driver_ty),
         };
-        let mut inner = ThinCell::new(raw_op);
+        Self::from_cell(ThinCell::new(raw_op))
+    }
+
+    /// Create [`RawOp`] and get the [`ErasedKey`] to it, unless the allocator
+    /// refuses the block it is kept in: refused, nothing is allocated and `op`
+    /// is handed back.
+    pub(crate) fn try_new<T: OpCode + 'static>(
+        op: T,
+        extra: Extra,
+        driver_ty: DriverType,
+    ) -> Result<Self, T> {
+        let raw_op = RawOp {
+            extra,
+            cancelled: false,
+            result: PushEntry::Pending(None),
+            carrier: Carrier::new(op, driver_ty),
+        };
+        match ThinCell::try_new(raw_op) {
+            Ok(inner) => Ok(Self::from_cell(inner)),
+            Err(raw_op) => Err(raw_op.carrier.into_inner()),
+        }
+    }
+
+    /// Initialize the carrier of a just created cell, now pinned in its block.
+    fn from_cell<T: OpCode + 'static>(mut inner: ThinCell<RawOp<Carrier<T>>>) -> Self {
         // SAFETY:
         // - ThinCell is just created, there will be no shared owner or borrower
         // - Carrier is being pinned by ThinCell, it will have a stable address
