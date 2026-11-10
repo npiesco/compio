@@ -2,9 +2,9 @@
 //! without allocating, and drops its funding only after the task's block is
 //! freed, measured with a counting allocator.
 //!
-//! The console's spans may allocate as a task is spawned, so these run without
-//! it.
-#![cfg(not(any(feature = "console", loom)))]
+//! With the `console` feature, a funded task is not reported, as its span would
+//! be allocated by the subscriber: these hold with a subscriber installed too.
+#![cfg(not(loom))]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -217,4 +217,32 @@ fn a_funded_task_released_on_another_thread_is_freed_and_unfunded_on_its_own() {
         Some(live()),
         "and the funding dropped there, only after it"
     );
+}
+
+#[cfg(feature = "console")]
+#[test]
+fn a_funded_spawn_allocates_no_console_span() {
+    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+    let exe = Executor::new();
+    warm(&exe);
+
+    let task = async {};
+    let layout = layout_of::<_, Funding>(&task);
+    let before = live();
+    let Ok(handle) = exe.try_spawn_funded(task, Funding) else {
+        panic!("the spawn was refused");
+    };
+    assert_eq!(
+        live() - before,
+        layout.size() as isize,
+        "nothing but the block, no span"
+    );
+    block_on(&exe, handle).unwrap();
+
+    // The first span the subscriber holds allocates its storage, which the
+    // spawn above would have shown had it made one.
+    let before = live();
+    let span = tracing::trace_span!("runtime.spawn");
+    assert!(live() > before, "the subscriber allocates a span");
+    drop(span);
 }

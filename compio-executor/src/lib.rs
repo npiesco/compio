@@ -214,24 +214,13 @@ impl Executor {
     /// allocating, and freed by the next [`tick`](Self::tick), the funding
     /// dropped after it. Only once the executor is dropped is such a block
     /// freed where its last reference goes, and its funding leaked.
-    #[track_caller]
+    ///
+    /// The task is not reported to the console: its span would be allocated by
+    /// the subscriber, outside of the block and of what the funding covers.
     pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
         &self,
         fut: F,
         funding: C,
-    ) -> Result<JoinHandle<F::Output>, F> {
-        self.try_spawn_funded_at(fut, funding, SpawnMeta::capture())
-    }
-
-    /// Spawn a future onto the executor like
-    /// [`try_spawn_funded`](Self::try_spawn_funded), attributing it to `meta`.
-    ///
-    /// See [`spawn_at`](Self::spawn_at) for what `meta` is good for.
-    pub fn try_spawn_funded_at<F: Future + 'static, C: 'static>(
-        &self,
-        fut: F,
-        funding: C,
-        meta: SpawnMeta,
     ) -> Result<JoinHandle<F::Output>, F> {
         let shared = self.shared();
         let tracker = shared.queue.tracker();
@@ -241,7 +230,7 @@ impl Executor {
             funding,
             retired: shared.retired.clone(),
         };
-        match queue.try_insert(self.ptr, tracker, fut, funding, meta) {
+        match queue.try_insert(self.ptr, tracker, fut, funding, SpawnMeta::untracked()) {
             Ok(task) => Ok(JoinHandle::new(task)),
             Err((fut, _)) => Err(fut),
         }

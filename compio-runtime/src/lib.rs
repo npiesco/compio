@@ -255,27 +255,15 @@ impl Runtime {
     /// allocating, and freed as the runtime next runs its tasks, the funding
     /// dropped after it. Only once the runtime is dropped is such a block freed
     /// where its last reference goes, and its funding leaked.
-    #[track_caller]
+    ///
+    /// The task is not reported to the console: its span would be allocated by
+    /// the subscriber, outside of the block and of what the funding covers.
     pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
         &self,
         future: F,
         funding: C,
     ) -> Result<JoinHandle<F::Output>, F> {
-        self.try_spawn_funded_at(future, funding, SpawnMeta::capture())
-    }
-
-    /// Spawns a new asynchronous task like
-    /// [`try_spawn_funded`](Self::try_spawn_funded), attributing it to `meta`
-    /// instead of to the caller.
-    ///
-    /// See [`spawn_at`](Self::spawn_at) for what `meta` is good for.
-    pub fn try_spawn_funded_at<F: Future + 'static, C: 'static>(
-        &self,
-        future: F,
-        funding: C,
-        meta: SpawnMeta,
-    ) -> Result<JoinHandle<F::Output>, F> {
-        self.executor.try_spawn_funded_at(future, funding, meta)
+        self.executor.try_spawn_funded(future, funding)
     }
 
     /// Spawns a blocking task in a new thread, and wait for it.
@@ -640,14 +628,11 @@ pub fn spawn_at<F: Future + 'static>(future: F, meta: SpawnMeta) -> JoinHandle<F
 ///
 /// This method doesn't create runtime. It tries to obtain the current runtime
 /// by [`Runtime::with_current`].
-#[track_caller]
 pub fn try_spawn_funded<F: Future + 'static, C: 'static>(
     future: F,
     funding: C,
 ) -> Result<JoinHandle<F::Output>, F> {
-    // See the note in `spawn` on why this is not inlined below.
-    let meta = SpawnMeta::capture();
-    Runtime::with_current(|r| r.try_spawn_funded_at(future, funding, meta))
+    Runtime::with_current(|r| r.try_spawn_funded(future, funding))
 }
 
 /// Spawns a blocking task in a new thread, and wait for it.
